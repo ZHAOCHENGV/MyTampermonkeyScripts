@@ -1,0 +1,247 @@
+// ==UserScript==
+// @name         VectorEngine 自动兑换助手 Pro (防检测版)
+// @namespace    http://tampermonkey.net/
+// @version      1.2
+// @description  自动兑换、金额统计、随机延迟防检测
+// @author       You
+// @match        https://api.vectorengine.ai/console/topup*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // --- 样式注入 ---
+    const style = document.createElement('style');
+    style.innerHTML = `
+        #ve-helper-panel {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            width: 320px;
+            background: #fff;
+            border: 1px solid #e1e3e6;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            border-radius: 12px;
+            z-index: 9999;
+            padding: 16px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+        #ve-helper-header {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            color: #1c1f23;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        #ve-code-input {
+            width: 100%;
+            height: 120px;
+            padding: 8px;
+            border: 1px solid #c6c8cc;
+            border-radius: 6px;
+            font-size: 12px;
+            resize: vertical;
+            margin-bottom: 10px;
+            box-sizing: border-box;
+        }
+        #ve-start-btn {
+            width: 100%;
+            padding: 8px 0;
+            background: #0064fa;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+        #ve-start-btn:hover { background: #0050c8; }
+        #ve-start-btn:disabled { background: #a0c0f0; cursor: not-allowed; }
+        #ve-status {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #666;
+            max-height: 120px;
+            overflow-y: auto;
+            border-top: 1px solid #eee;
+            padding-top: 5px;
+        }
+        .ve-log-success { color: #00a000; font-weight: bold; }
+        .ve-log-error { color: #d00000; }
+        .ve-log-info { color: #0064fa; }
+        .ve-log-wait { color: #888; font-style: italic; }
+    `;
+    document.head.appendChild(style);
+
+    // --- 创建UI面板 ---
+    const panel = document.createElement('div');
+    panel.id = 've-helper-panel';
+    panel.innerHTML = `
+        <div id="ve-helper-header">
+            自动兑换助手 Pro (防检测)
+            <span style="font-size:12px;color:#999;cursor:pointer" onclick="this.parentElement.parentElement.style.display='none'">[关闭]</span>
+        </div>
+        <textarea id="ve-code-input" placeholder="请在此处粘贴兑换码，支持格式：\n卡号：c26c5200...\n每行一个"></textarea>
+        <button id="ve-start-btn">开始自动兑换</button>
+        <div id="ve-status">等待开始...</div>
+    `;
+    document.body.appendChild(panel);
+
+    const statusDiv = document.getElementById('ve-status');
+    const inputArea = document.getElementById('ve-code-input');
+    const startBtn = document.getElementById('ve-start-btn');
+
+    // --- 核心工具函数 ---
+
+    function log(msg, type = 'normal') {
+        const p = document.createElement('div');
+        p.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        if (type === 'success') p.className = 've-log-success';
+        if (type === 'error') p.className = 've-log-error';
+        if (type === 'info') p.className = 've-log-info';
+        if (type === 'wait') p.className = 've-log-wait';
+        statusDiv.prepend(p);
+    }
+
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // 生成随机整数 (min 到 max 之间)
+    const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
+
+    // React/Vue 输入框赋值 Hack
+    function setNativeValue(element, value) {
+        const valueSetter = Object.getOwnPropertyDescriptor(element, value) ?
+            Object.getOwnPropertyDescriptor(element, value).set :
+            Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+
+        valueSetter.call(element, value);
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function parseCodes(text) {
+        const lines = text.split('\n');
+        const codes = [];
+        const regex = /(?:卡号[:：]?)?\s*([a-zA-Z0-9]{32})/;
+        for (let line of lines) {
+            const match = line.match(regex);
+            if (match && match[1]) codes.push(match[1]);
+        }
+        return codes;
+    }
+
+    function parseAmount(text) {
+        const match = text.match(/\$\s*([0-9,]+(?:\.[0-9]+)?)/);
+        if (match) return parseFloat(match[1].replace(/,/g, ''));
+        return 0;
+    }
+
+    // --- 自动化逻辑 ---
+
+    async function processRedemption(codes) {
+        startBtn.disabled = true;
+        let totalAmount = 0.00;
+        let successCount = 0;
+
+        for (let i = 0; i < codes.length; i++) {
+            const code = codes[i];
+            startBtn.textContent = `正在处理 (${i + 1}/${codes.length})...`;
+
+            try {
+                // 1. 寻找输入框
+                const inputEl = document.querySelector('input[placeholder="请输入兑换码"]');
+                if (!inputEl) throw new Error("找不到输入框");
+
+                // 2. 填入验证码
+                setNativeValue(inputEl, code);
+                // 输入后稍微等待，模拟人手停顿
+                await sleep(300);
+
+                // 3. 寻找并点击兑换按钮
+                const allBtns = Array.from(document.querySelectorAll('button'));
+                const redeemBtn = allBtns.find(btn => btn.textContent.includes('兑换') && !btn.textContent.includes('码'));
+
+                if (!redeemBtn || redeemBtn.disabled) {
+                    throw new Error("兑换按钮不可用");
+                }
+                redeemBtn.click();
+
+                // 4. 轮询检测结果
+                let attempts = 0;
+                let isSuccess = false;
+
+                while (attempts < 25) { // 5秒超时
+                    await sleep(200);
+                    const successTitle = document.querySelector('.semi-modal-confirm-title-text');
+
+                    if (successTitle && successTitle.textContent.includes('兑换成功')) {
+                        isSuccess = true;
+
+                        // 统计金额
+                        const contentEl = document.querySelector('.semi-modal-confirm-content');
+                        let currentAmount = 0;
+                        if (contentEl) currentAmount = parseAmount(contentEl.textContent);
+
+                        totalAmount += currentAmount;
+                        successCount++;
+                        log(`成功: +$${currentAmount.toFixed(2)} (尾号:${code.slice(-4)})`, 'success');
+
+                        // 关闭弹窗
+                        await sleep(500);
+                        const confirmBtn = document.querySelector('button[aria-label="confirm"]');
+                        if (confirmBtn) confirmBtn.click();
+                        else document.body.dispatchEvent(new KeyboardEvent('keydown', {'key': 'Escape'}));
+
+                        break;
+                    }
+                    attempts++;
+                }
+
+                if (!isSuccess) {
+                    log(`超时或失败: ${code.slice(0,6)}...`, 'error');
+                }
+
+                // --- 5. 核心修改：随机延迟 (1000ms - 2000ms) ---
+                if (i < codes.length - 1) { // 如果不是最后一个，才需要等待
+                    const waitTime = randomDelay(1000, 2000);
+                    log(`随机休息 ${waitTime}ms...`, 'wait');
+                    await sleep(waitTime);
+                }
+
+            } catch (err) {
+                log(`错误: ${err.message}`, 'error');
+                await sleep(1000);
+            }
+        }
+
+        // --- 结束 ---
+        startBtn.disabled = false;
+        startBtn.textContent = '开始自动兑换';
+
+        const finalMsg = `任务完成！\n\n成功兑换：${successCount} 个\n累计总金额：$${totalAmount.toFixed(2)}`;
+        log(finalMsg, 'info');
+        alert(finalMsg);
+    }
+
+    // --- 事件绑定 ---
+    startBtn.addEventListener('click', () => {
+        const rawText = inputArea.value;
+        if (!rawText.trim()) {
+            alert('请输入兑换码');
+            return;
+        }
+
+        const codes = parseCodes(rawText);
+        if (codes.length === 0) {
+            log("无有效兑换码", 'error');
+            return;
+        }
+
+        log(`开始处理 ${codes.length} 个兑换码...`);
+        processRedemption(codes);
+    });
+
+})();
