@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         VectorEngine 自动兑换助手 Pro (防检测版)
+// @name         VectorEngine 自动兑换助手 (终极防检测版)
 // @namespace    http://tampermonkey.net/
-// @version      1.2
-// @description  自动兑换、金额统计、随机延迟防检测
+// @version      1.3
+// @description  全真模拟鼠标事件、随机微观延迟、长短休息机制、金额统计
 // @author       You
 // @match        https://api.vectorengine.ai/console/topup*
 // @grant        none
@@ -10,6 +10,15 @@
 
 (function() {
     'use strict';
+
+    // --- 配置区域 (可自行调整) ---
+    const CONFIG = {
+        minDelay: 2000,      // 单次兑换最小间隔 (毫秒)
+        maxDelay: 4000,      // 单次兑换最大间隔 (毫秒)
+        breakInterval: 5,    // 每兑换多少个码休息一次
+        breakMin: 5000,      // 休息最小时间 (毫秒)
+        breakMax: 10000      // 休息最大时间 (毫秒)
+    };
 
     // --- 样式注入 ---
     const style = document.createElement('style');
@@ -38,7 +47,7 @@
         }
         #ve-code-input {
             width: 100%;
-            height: 120px;
+            height: 100px;
             padding: 8px;
             border: 1px solid #c6c8cc;
             border-radius: 6px;
@@ -64,7 +73,7 @@
             margin-top: 10px;
             font-size: 12px;
             color: #666;
-            max-height: 120px;
+            max-height: 150px;
             overflow-y: auto;
             border-top: 1px solid #eee;
             padding-top: 5px;
@@ -72,21 +81,22 @@
         .ve-log-success { color: #00a000; font-weight: bold; }
         .ve-log-error { color: #d00000; }
         .ve-log-info { color: #0064fa; }
-        .ve-log-wait { color: #888; font-style: italic; }
+        .ve-log-wait { color: #d97706; font-style: italic; }
+        .ve-log-break { color: #7c3aed; font-weight: bold; background: #f3e8ff; padding: 2px 4px; border-radius: 4px; }
     `;
     document.head.appendChild(style);
 
-    // --- 创建UI面板 ---
+    // --- UI 构建 ---
     const panel = document.createElement('div');
     panel.id = 've-helper-panel';
     panel.innerHTML = `
         <div id="ve-helper-header">
-            自动兑换助手 Pro (防检测)
+            兑换助手 (真人模拟版)
             <span style="font-size:12px;color:#999;cursor:pointer" onclick="this.parentElement.parentElement.style.display='none'">[关闭]</span>
         </div>
-        <textarea id="ve-code-input" placeholder="请在此处粘贴兑换码，支持格式：\n卡号：c26c5200...\n每行一个"></textarea>
-        <button id="ve-start-btn">开始自动兑换</button>
-        <div id="ve-status">等待开始...</div>
+        <textarea id="ve-code-input" placeholder="粘贴兑换码...\n卡号：c26c5200..."></textarea>
+        <button id="ve-start-btn">开始拟人兑换</button>
+        <div id="ve-status">就绪...</div>
     `;
     document.body.appendChild(panel);
 
@@ -94,29 +104,43 @@
     const inputArea = document.getElementById('ve-code-input');
     const startBtn = document.getElementById('ve-start-btn');
 
-    // --- 核心工具函数 ---
+    // --- 工具函数 ---
 
     function log(msg, type = 'normal') {
         const p = document.createElement('div');
-        p.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        p.innerHTML = `<span style="opacity:0.6">[${new Date().toLocaleTimeString().split(' ')[0]}]</span> ${msg}`;
         if (type === 'success') p.className = 've-log-success';
         if (type === 'error') p.className = 've-log-error';
         if (type === 'info') p.className = 've-log-info';
         if (type === 'wait') p.className = 've-log-wait';
+        if (type === 'break') p.className = 've-log-break';
         statusDiv.prepend(p);
     }
 
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-    // 生成随机整数 (min 到 max 之间)
     const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
 
-    // React/Vue 输入框赋值 Hack
+    // 核心：全真鼠标点击模拟
+    // 依次触发 mouseover -> mousedown -> mouseup -> click
+    function simulateHumanClick(element) {
+        if (!element) return;
+        const events = ['mouseover', 'mousedown', 'mouseup', 'click'];
+        events.forEach(eventType => {
+            const event = new MouseEvent(eventType, {
+                bubbles: true,
+                cancelable: true,
+                view: window
+            });
+            element.dispatchEvent(event);
+        });
+    }
+
+    // React 输入框赋值
     function setNativeValue(element, value) {
         const valueSetter = Object.getOwnPropertyDescriptor(element, value) ?
             Object.getOwnPropertyDescriptor(element, value).set :
             Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-
+        
         valueSetter.call(element, value);
         element.dispatchEvent(new Event('input', { bubbles: true }));
         element.dispatchEvent(new Event('change', { bubbles: true }));
@@ -139,7 +163,7 @@
         return 0;
     }
 
-    // --- 自动化逻辑 ---
+    // --- 主逻辑 ---
 
     async function processRedemption(codes) {
         startBtn.disabled = true;
@@ -148,99 +172,99 @@
 
         for (let i = 0; i < codes.length; i++) {
             const code = codes[i];
-            startBtn.textContent = `正在处理 (${i + 1}/${codes.length})...`;
+            startBtn.textContent = `执行中 (${i + 1}/${codes.length})...`;
+            
+            // --- 检查是否需要“中场休息” ---
+            if (i > 0 && i % CONFIG.breakInterval === 0) {
+                const breakTime = randomDelay(CONFIG.breakMin, CONFIG.breakMax);
+                log(`🍵 触发中场休息，暂停 ${(breakTime/1000).toFixed(1)} 秒...`, 'break');
+                await sleep(breakTime);
+            }
 
             try {
-                // 1. 寻找输入框
+                // 1. 定位输入框
                 const inputEl = document.querySelector('input[placeholder="请输入兑换码"]');
-                if (!inputEl) throw new Error("找不到输入框");
+                if (!inputEl) throw new Error("输入框未找到");
 
-                // 2. 填入验证码
+                // 2. 填入 (模拟粘贴后的人眼确认延迟)
                 setNativeValue(inputEl, code);
-                // 输入后稍微等待，模拟人手停顿
-                await sleep(300);
+                await sleep(randomDelay(500, 1200)); 
 
-                // 3. 寻找并点击兑换按钮
+                // 3. 定位按钮
                 const allBtns = Array.from(document.querySelectorAll('button'));
                 const redeemBtn = allBtns.find(btn => btn.textContent.includes('兑换') && !btn.textContent.includes('码'));
+                
+                if (!redeemBtn || redeemBtn.disabled) throw new Error("按钮不可用");
 
-                if (!redeemBtn || redeemBtn.disabled) {
-                    throw new Error("兑换按钮不可用");
-                }
-                redeemBtn.click();
-
-                // 4. 轮询检测结果
+                // 4. 模拟真人点击
+                simulateHumanClick(redeemBtn);
+                
+                // 5. 等待弹窗 (轮询)
                 let attempts = 0;
                 let isSuccess = false;
-
-                while (attempts < 25) { // 5秒超时
+                
+                while (attempts < 30) { 
                     await sleep(200);
                     const successTitle = document.querySelector('.semi-modal-confirm-title-text');
-
+                    
                     if (successTitle && successTitle.textContent.includes('兑换成功')) {
                         isSuccess = true;
-
-                        // 统计金额
+                        
+                        // 统计
                         const contentEl = document.querySelector('.semi-modal-confirm-content');
                         let currentAmount = 0;
                         if (contentEl) currentAmount = parseAmount(contentEl.textContent);
-
+                        
                         totalAmount += currentAmount;
                         successCount++;
                         log(`成功: +$${currentAmount.toFixed(2)} (尾号:${code.slice(-4)})`, 'success');
 
-                        // 关闭弹窗
-                        await sleep(500);
+                        // 模拟看到成功后的反应延迟，再关闭
+                        await sleep(randomDelay(800, 1500));
+                        
                         const confirmBtn = document.querySelector('button[aria-label="confirm"]');
-                        if (confirmBtn) confirmBtn.click();
+                        if (confirmBtn) simulateHumanClick(confirmBtn);
                         else document.body.dispatchEvent(new KeyboardEvent('keydown', {'key': 'Escape'}));
-
+                        
                         break;
                     }
                     attempts++;
                 }
 
                 if (!isSuccess) {
-                    log(`超时或失败: ${code.slice(0,6)}...`, 'error');
+                    log(`未检测到成功: ${code.slice(0,6)}...`, 'error');
                 }
 
-                // --- 5. 核心修改：随机延迟 (1000ms - 2000ms) ---
-                if (i < codes.length - 1) { // 如果不是最后一个，才需要等待
-                    const waitTime = randomDelay(1000, 2000);
-                    log(`随机休息 ${waitTime}ms...`, 'wait');
+                // --- 6. 每一个之间的随机延迟 ---
+                if (i < codes.length - 1) {
+                    const waitTime = randomDelay(CONFIG.minDelay, CONFIG.maxDelay);
+                    log(`等待 ${(waitTime/1000).toFixed(1)} 秒...`, 'wait');
                     await sleep(waitTime);
                 }
 
             } catch (err) {
-                log(`错误: ${err.message}`, 'error');
-                await sleep(1000);
+                log(`异常: ${err.message}`, 'error');
+                await sleep(2000);
             }
         }
 
-        // --- 结束 ---
         startBtn.disabled = false;
-        startBtn.textContent = '开始自动兑换';
-
-        const finalMsg = `任务完成！\n\n成功兑换：${successCount} 个\n累计总金额：$${totalAmount.toFixed(2)}`;
+        startBtn.textContent = '开始拟人兑换';
+        
+        const finalMsg = `任务结束\n成功：${successCount} 个\n总额：$${totalAmount.toFixed(2)}`;
         log(finalMsg, 'info');
         alert(finalMsg);
     }
 
-    // --- 事件绑定 ---
+    // --- 启动监听 ---
     startBtn.addEventListener('click', () => {
         const rawText = inputArea.value;
-        if (!rawText.trim()) {
-            alert('请输入兑换码');
-            return;
-        }
+        if (!rawText.trim()) return alert('请先输入兑换码');
 
         const codes = parseCodes(rawText);
-        if (codes.length === 0) {
-            log("无有效兑换码", 'error');
-            return;
-        }
+        if (codes.length === 0) return log("无效的兑换码格式", 'error');
 
-        log(`开始处理 ${codes.length} 个兑换码...`);
+        log(`解析到 ${codes.length} 个兑换码，脚本启动...`);
         processRedemption(codes);
     });
 
