@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         VectorEngine 自动兑换助手 (终极防检测版)
+// @name         VectorEngine 自动兑换助手
 // @namespace    http://tampermonkey.net/
-// @version      1.3
-// @description  全真模拟鼠标事件、随机微观延迟、长短休息机制、金额统计
+// @version      1.6
+// @description  失败立即重试、最后输出失败列表、成功统计金额
 // @author       You
 // @match        https://api.vectorengine.ai/console/topup*
 // @grant        none
@@ -11,13 +11,13 @@
 (function() {
     'use strict';
 
-    // --- 配置区域 (可自行调整) ---
+    // --- 配置区域 ---
     const CONFIG = {
-        minDelay: 2000,      // 单次兑换最小间隔 (毫秒)
-        maxDelay: 4000,      // 单次兑换最大间隔 (毫秒)
-        breakInterval: 5,    // 每兑换多少个码休息一次
-        breakMin: 5000,      // 休息最小时间 (毫秒)
-        breakMax: 10000      // 休息最大时间 (毫秒)
+        successDelayMin: 2000,   // 成功后的等待时间 (最小)
+        successDelayMax: 4000,   // 成功后的等待时间 (最大)
+        failDelay: 300,          // 失败后的缓冲时间 (毫秒，建议保留少量缓冲防止浏览器卡顿)
+        breakInterval: 10,       // 每处理多少个(无论成功失败)休息一次
+        breakTime: 3000          // 休息时间 (为了防止API速率限制，建议保留一点)
     };
 
     // --- 样式注入 ---
@@ -27,7 +27,7 @@
             position: fixed;
             top: 20px;
             right: 20px;
-            width: 320px;
+            width: 340px;
             background: #fff;
             border: 1px solid #e1e3e6;
             box-shadow: 0 4px 12px rgba(0,0,0,0.15);
@@ -73,16 +73,16 @@
             margin-top: 10px;
             font-size: 12px;
             color: #666;
-            max-height: 150px;
+            max-height: 200px;
             overflow-y: auto;
             border-top: 1px solid #eee;
             padding-top: 5px;
         }
         .ve-log-success { color: #00a000; font-weight: bold; }
-        .ve-log-error { color: #d00000; }
+        .ve-log-error { color: #d00000; font-weight: bold; }
         .ve-log-info { color: #0064fa; }
         .ve-log-wait { color: #d97706; font-style: italic; }
-        .ve-log-break { color: #7c3aed; font-weight: bold; background: #f3e8ff; padding: 2px 4px; border-radius: 4px; }
+        .ve-log-break { color: #7c3aed; background: #f3e8ff; padding: 2px 4px; border-radius: 4px; }
     `;
     document.head.appendChild(style);
 
@@ -91,11 +91,11 @@
     panel.id = 've-helper-panel';
     panel.innerHTML = `
         <div id="ve-helper-header">
-            兑换助手 (真人模拟版)
+            助手 v1.6 (极速失败版)
             <span style="font-size:12px;color:#999;cursor:pointer" onclick="this.parentElement.parentElement.style.display='none'">[关闭]</span>
         </div>
         <textarea id="ve-code-input" placeholder="粘贴兑换码...\n卡号：c26c5200..."></textarea>
-        <button id="ve-start-btn">开始拟人兑换</button>
+        <button id="ve-start-btn">开始处理</button>
         <div id="ve-status">就绪...</div>
     `;
     document.body.appendChild(panel);
@@ -120,22 +120,13 @@
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
     const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
 
-    // 核心：全真鼠标点击模拟
-    // 依次触发 mouseover -> mousedown -> mouseup -> click
     function simulateHumanClick(element) {
         if (!element) return;
-        const events = ['mouseover', 'mousedown', 'mouseup', 'click'];
-        events.forEach(eventType => {
-            const event = new MouseEvent(eventType, {
-                bubbles: true,
-                cancelable: true,
-                view: window
-            });
-            element.dispatchEvent(event);
+        ['mouseover', 'mousedown', 'mouseup', 'click'].forEach(eventType => {
+            element.dispatchEvent(new MouseEvent(eventType, { bubbles: true, cancelable: true, view: window }));
         });
     }
 
-    // React 输入框赋值
     function setNativeValue(element, value) {
         const valueSetter = Object.getOwnPropertyDescriptor(element, value) ?
             Object.getOwnPropertyDescriptor(element, value).set :
@@ -169,94 +160,140 @@
         startBtn.disabled = true;
         let totalAmount = 0.00;
         let successCount = 0;
+        let failCount = 0;
+        let failedList = []; // 存储失败的码
 
         for (let i = 0; i < codes.length; i++) {
             const code = codes[i];
-            startBtn.textContent = `执行中 (${i + 1}/${codes.length})...`;
+            const displayCode = `...${code.slice(-4)}`;
+            startBtn.textContent = `执行中 (${i + 1}/${codes.length})`;
             
-            // --- 检查是否需要“中场休息” ---
+            // 安全机制：连续大量请求即使失败也可能被防火墙ban，所以每10个还是小休一下
             if (i > 0 && i % CONFIG.breakInterval === 0) {
-                const breakTime = randomDelay(CONFIG.breakMin, CONFIG.breakMax);
-                log(`🍵 触发中场休息，暂停 ${(breakTime/1000).toFixed(1)} 秒...`, 'break');
-                await sleep(breakTime);
+                log(`🍵 批量安全休息 ${CONFIG.breakTime/1000}s...`, 'break');
+                await sleep(CONFIG.breakTime);
             }
 
             try {
-                // 1. 定位输入框
+                // 1. 输入
                 const inputEl = document.querySelector('input[placeholder="请输入兑换码"]');
-                if (!inputEl) throw new Error("输入框未找到");
-
-                // 2. 填入 (模拟粘贴后的人眼确认延迟)
+                if (!inputEl) throw new Error("输入框丢失");
+                
                 setNativeValue(inputEl, code);
-                await sleep(randomDelay(500, 1200)); 
+                await sleep(500); // 必须保留少量输入延迟，否则网站反应不过来
 
-                // 3. 定位按钮
+                // 2. 点击
                 const allBtns = Array.from(document.querySelectorAll('button'));
                 const redeemBtn = allBtns.find(btn => btn.textContent.includes('兑换') && !btn.textContent.includes('码'));
                 
                 if (!redeemBtn || redeemBtn.disabled) throw new Error("按钮不可用");
-
-                // 4. 模拟真人点击
                 simulateHumanClick(redeemBtn);
                 
-                // 5. 等待弹窗 (轮询)
+                // 3. 结果检测
                 let attempts = 0;
-                let isSuccess = false;
-                
-                while (attempts < 30) { 
-                    await sleep(200);
-                    const successTitle = document.querySelector('.semi-modal-confirm-title-text');
-                    
-                    if (successTitle && successTitle.textContent.includes('兑换成功')) {
-                        isSuccess = true;
-                        
-                        // 统计
-                        const contentEl = document.querySelector('.semi-modal-confirm-content');
-                        let currentAmount = 0;
-                        if (contentEl) currentAmount = parseAmount(contentEl.textContent);
-                        
-                        totalAmount += currentAmount;
-                        successCount++;
-                        log(`成功: +$${currentAmount.toFixed(2)} (尾号:${code.slice(-4)})`, 'success');
+                let result = 'pending'; 
+                let failReason = "未知错误";
 
-                        // 模拟看到成功后的反应延迟，再关闭
-                        await sleep(randomDelay(800, 1500));
+                while (attempts < 20) { // 等待时间缩短，提高效率
+                    await sleep(200);
+                    
+                    const successTitle = document.querySelector('.semi-modal-confirm-title-text');
+                    const toastText = document.querySelector('.semi-toast-content-text');
+
+                    if (successTitle && successTitle.textContent.includes('兑换成功')) {
+                        // === 成功 ===
+                        result = 'success';
+                        const contentEl = document.querySelector('.semi-modal-confirm-content');
+                        let amount = contentEl ? parseAmount(contentEl.textContent) : 0;
+                        totalAmount += amount;
+                        successCount++;
+                        log(`✅ 成功: +$${amount.toFixed(2)} (${displayCode})`, 'success');
                         
+                        // 关闭弹窗
+                        await sleep(500);
                         const confirmBtn = document.querySelector('button[aria-label="confirm"]');
                         if (confirmBtn) simulateHumanClick(confirmBtn);
-                        else document.body.dispatchEvent(new KeyboardEvent('keydown', {'key': 'Escape'}));
+                        break;
+                    } 
+                    else if (toastText) {
+                        // === 失败 ===
+                        result = 'fail';
+                        failReason = toastText.textContent.trim();
+                        failCount++;
+                        log(`❌ 失败: ${failReason} (${displayCode})`, 'error');
                         
+                        // 记录失败
+                        failedList.push({ code: code, reason: failReason });
+
+                        // 关闭 Toast
+                        const closeToastBtn = document.querySelector('.semi-toast-close-button button');
+                        if (closeToastBtn) simulateHumanClick(closeToastBtn);
+                        await sleep(500); // 等待Toast消失
                         break;
                     }
                     attempts++;
                 }
 
-                if (!isSuccess) {
-                    log(`未检测到成功: ${code.slice(0,6)}...`, 'error');
+                if (result === 'pending') {
+                    failReason = "超时未响应";
+                    log(`⚠️ 失败: ${failReason} (${displayCode})`, 'error');
+                    failedList.push({ code: code, reason: failReason });
+                    failCount++;
+                    result = 'fail'; // 视为失败
                 }
 
-                // --- 6. 每一个之间的随机延迟 ---
+                // --- 4. 智能延迟策略 (核心修改) ---
                 if (i < codes.length - 1) {
-                    const waitTime = randomDelay(CONFIG.minDelay, CONFIG.maxDelay);
-                    log(`等待 ${(waitTime/1000).toFixed(1)} 秒...`, 'wait');
-                    await sleep(waitTime);
+                    if (result === 'success') {
+                        // 成功了，为了安全，模拟真人休息一下
+                        const waitTime = randomDelay(CONFIG.successDelayMin, CONFIG.successDelayMax);
+                        log(`等待 ${(waitTime/1000).toFixed(1)} 秒...`, 'wait');
+                        await sleep(waitTime);
+                    } else {
+                        // 失败了，无需等待，直接冲下一个
+                        log(`>> 立即处理下一个`, 'wait');
+                        await sleep(CONFIG.failDelay); 
+                    }
                 }
 
             } catch (err) {
                 log(`异常: ${err.message}`, 'error');
-                await sleep(2000);
+                failedList.push({ code: code, reason: `脚本异常: ${err.message}` });
+                failCount++;
+                await sleep(1000);
             }
         }
 
         startBtn.disabled = false;
-        startBtn.textContent = '开始拟人兑换';
+        startBtn.textContent = '开始处理';
         
-        const finalMsg = `任务结束\n成功：${successCount} 个\n总额：$${totalAmount.toFixed(2)}`;
-        log(finalMsg, 'info');
-        alert(finalMsg);
+        // --- 结束报告 ---
+        let report = `执行结束\n✅ 成功：${successCount}\n❌ 失败：${failCount}\n💰 总额：$${totalAmount.toFixed(2)}`;
+        
+        if (failedList.length > 0) {
+            log('正在将失败的兑换码回填至输入框...', 'info');
+            // 将失败的码整理好，放回输入框，方便复制
+            const failedText = failedList.map(item => `卡号：${item.code}  (原因: ${item.reason})`).join('\n');
+            inputArea.value = failedText;
+            report += `\n\n[提示] 失败的兑换码已自动填入文本框，方便您复制。`;
+        } else {
+            inputArea.value = "全部兑换成功！";
+        }
+
+        log('------------------------', 'info');
+        // 将失败列表打印到日志区域
+        failedList.forEach(f => {
+            const p = document.createElement('div');
+            p.style.color = '#d00000';
+            p.style.fontSize = '11px';
+            p.textContent = `失败: ${f.code} (${f.reason})`;
+            statusDiv.appendChild(p);
+        });
+
+        alert(report);
     }
 
-    // --- 启动监听 ---
+    // --- 事件 ---
     startBtn.addEventListener('click', () => {
         const rawText = inputArea.value;
         if (!rawText.trim()) return alert('请先输入兑换码');
@@ -264,7 +301,7 @@
         const codes = parseCodes(rawText);
         if (codes.length === 0) return log("无效的兑换码格式", 'error');
 
-        log(`解析到 ${codes.length} 个兑换码，脚本启动...`);
+        log(`解析到 ${codes.length} 个码，开始执行...`);
         processRedemption(codes);
     });
 
